@@ -1,27 +1,18 @@
 [project]
-name = "autoresearch"
+name = "autoresearch-astro"
 version = "0.1.0"
-description = "Autonomous pretraining research swarm"
+description = "Autonomous research swarm for streaming crossmatched astronomical surveys"
 readme = "README.md"
-requires-python = ">=3.10"
+requires-python = ">=3.11"
 dependencies = [
-    "kernels>=0.11.7",
-    "matplotlib>=3.10.8",
-    "numpy>=2.2.6",
-    "pandas>=2.3.3",
-    "pyarrow>=21.0.0",
-    "requests>=2.32.0",
-    "rustbpe>=0.1.0",
-    "tiktoken>=0.11.0",
-    "torch==2.9.1",
+    "lsdb==0.9.0",
+    "hats==0.9.0",
+    "nested-pandas>=0.6.8",
+    "dask[distributed]>=2025.3.0",
+    "huggingface-hub>=0.30.0",
+    "pyarrow>=19.0.0",
+    "numpy>=2.0.0",
+    "pandas>=2.2.0",
+    "psutil>=6.0.0",
+    "matplotlib>=3.10.0",
 ]
-
-[tool.uv.sources]
-torch = [
-    { index = "pytorch-cu128" },
-]
-
-[[tool.uv.index]]
-name = "pytorch-cu128"
-url = "https://download.pytorch.org/whl/cu128"
-explicit = true

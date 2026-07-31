@@ -1,389 +1,498 @@
 """
-One-time data preparation for autoresearch experiments.
-Downloads data shards and trains a BPE tokenizer.
+One-time preparation and the fixed metric for autoresearch-astro experiments.
+
+Builds the ground-truth crossmatch table used to verify streamed records, and
+provides the benchmark harness that every experiment is scored by.
 
 Usage:
-    python prepare.py                  # full prep (download + tokenizer)
-    python prepare.py --num-shards 8   # download only 8 shards (for testing)
+    python prepare.py                    # full prep (build truth table + audit digests)
+    python prepare.py --max-partitions 8 # partial build (for testing the harness)
 
-Data and tokenizer are stored in ~/.cache/autoresearch/.
+Artifacts are stored in ~/.cache/autoresearch-astro/.
+
+This file is READ-ONLY for the research agent. It defines the metric.
 """
 
 import os
 import sys
+import json
 import time
-import math
+import shutil
+import atexit
+import hashlib
 import argparse
-import pickle
-from multiprocessing import Pool
+import tempfile
+import threading
 
-import requests
-import pyarrow.parquet as pq
-import rustbpe
-import tiktoken
-import torch
+import numpy as np
+import psutil
+
+# ---------------------------------------------------------------------------
+# Cold cache
+#
+# Every run must stream from HuggingFace with a cold cache -- the research
+# problem is "stream this fast", not "download this once". We point every
+# cache HuggingFace/fsspec might use at a fresh temp dir, created at import
+# time (so it is set before anything imports lsdb) and removed at exit.
+# ---------------------------------------------------------------------------
+
+# Worker subprocesses import this module too, and inherit the variable below, so
+# the whole process tree shares one cache and only the process that created it
+# cleans it up.
+RUN_CACHE = os.environ.get("AUTORESEARCH_RUN_CACHE")
+if RUN_CACHE is None or not os.path.isdir(RUN_CACHE):
+    RUN_CACHE = tempfile.mkdtemp(prefix="autoresearch-astro-", dir=os.environ.get("AUTORESEARCH_TMP") or None)
+    os.environ["AUTORESEARCH_RUN_CACHE"] = RUN_CACHE
+    atexit.register(shutil.rmtree, RUN_CACHE, True)
+
+os.environ["HF_HOME"] = os.path.join(RUN_CACHE, "hf")
+os.environ["HF_HUB_CACHE"] = os.path.join(RUN_CACHE, "hf", "hub")
+os.environ["HF_DATASETS_CACHE"] = os.path.join(RUN_CACHE, "hf", "datasets")
+os.environ["XDG_CACHE_HOME"] = os.path.join(RUN_CACHE, "xdg")
+os.environ["HF_HUB_DISABLE_PROGRESS_BARS"] = "1"
 
 # ---------------------------------------------------------------------------
 # Constants (fixed, do not modify)
 # ---------------------------------------------------------------------------
 
-MAX_SEQ_LEN = 2048       # context length
-TIME_BUDGET = 300        # training time budget in seconds (5 minutes)
-EVAL_TOKENS = 40 * 524288  # number of tokens for val eval
+# Images: 14,174,203 galaxy cutouts, 152x152 in 3 bands, 3.4 TiB, 5488 partitions.
+CATALOG_A = "hf://datasets/UniverseTBD/mmu_ssl_legacysurvey_north"
+# Spectra: 1,126,441 DESI EDR SV3 spectra, 61.8 GiB, 306 partitions.
+CATALOG_B = "hf://datasets/UniverseTBD/mmu_desi_edr_sv3"
+
+RADIUS_ARCSEC = 1.0      # crossmatch radius
+N_NEIGHBORS = 1          # nearest match only
+SUFFIXES = ("_ls", "_desi")
+
+TIME_BUDGET = 90         # wall clock seconds per experiment, cold start INCLUDED
+# How far ahead of the canonical order a run may reach. Sized to leave room for
+# deep parallel prefetch (this machine has 24 cores, so a partition-per-core
+# implementation can legitimately leave ~24 partitions unfinished when the clock
+# stops) while still refusing a run that skips ahead to the match-dense ones.
+IN_FLIGHT_WINDOW = 32
+AUDIT_PARTITIONS = (0, 1)  # partitions whose payloads are verified bit-exactly
+
+IMAGE_SHAPE = (3, 152, 152)  # (band, y, x) -- des-g, des-r, des-z
 
 # ---------------------------------------------------------------------------
 # Configuration
 # ---------------------------------------------------------------------------
 
-CACHE_DIR = os.path.join(os.path.expanduser("~"), ".cache", "autoresearch")
-DATA_DIR = os.path.join(CACHE_DIR, "data")
-TOKENIZER_DIR = os.path.join(CACHE_DIR, "tokenizer")
-BASE_URL = "https://huggingface.co/datasets/karpathy/climbmix-400b-shuffle/resolve/main"
-MAX_SHARD = 6542 # the last datashard is shard_06542.parquet
-VAL_SHARD = MAX_SHARD  # pinned validation shard (shard_06542)
-VAL_FILENAME = f"shard_{VAL_SHARD:05d}.parquet"
-VOCAB_SIZE = 8192
+CACHE_DIR = os.path.join(os.path.expanduser("~"), ".cache", "autoresearch-astro")
+TRUTH_PATH = os.path.join(CACHE_DIR, "truth.parquet")
+ORDER_PATH = os.path.join(CACHE_DIR, "canonical_order.json")
+AUDIT_PATH = os.path.join(CACHE_DIR, "audit.npz")
 
-# BPE split pattern (GPT-4 style, with \p{N}{1,2} instead of {1,3})
-SPLIT_PATTERN = r"""'(?i:[sdmt]|ll|ve|re)|[^\r\n\p{L}\p{N}]?+\p{L}+|\p{N}{1,2}| ?[^\s\p{L}\p{N}]++[\r\n]*|\s*[\r\n]|\s+(?!\S)|\s+"""
-
-SPECIAL_TOKENS = [f"<|reserved_{i}|>" for i in range(4)]
-BOS_TOKEN = "<|reserved_0|>"
-
-# ---------------------------------------------------------------------------
-# Data download
-# ---------------------------------------------------------------------------
-
-def download_single_shard(index):
-    """Download one parquet shard with retries. Returns True on success."""
-    filename = f"shard_{index:05d}.parquet"
-    filepath = os.path.join(DATA_DIR, filename)
-    if os.path.exists(filepath):
-        return True
-
-    url = f"{BASE_URL}/{filename}"
-    max_attempts = 5
-    for attempt in range(1, max_attempts + 1):
-        try:
-            response = requests.get(url, stream=True, timeout=30)
-            response.raise_for_status()
-            temp_path = filepath + ".tmp"
-            with open(temp_path, "wb") as f:
-                for chunk in response.iter_content(chunk_size=1024 * 1024):
-                    if chunk:
-                        f.write(chunk)
-            os.rename(temp_path, filepath)
-            print(f"  Downloaded {filename}")
-            return True
-        except (requests.RequestException, IOError) as e:
-            print(f"  Attempt {attempt}/{max_attempts} failed for {filename}: {e}")
-            for path in [filepath + ".tmp", filepath]:
-                if os.path.exists(path):
-                    try:
-                        os.remove(path)
-                    except OSError:
-                        pass
-            if attempt < max_attempts:
-                time.sleep(2 ** attempt)
-    return False
-
-
-def download_data(num_shards, download_workers=8):
-    """Download training shards + pinned validation shard."""
-    os.makedirs(DATA_DIR, exist_ok=True)
-    num_train = min(num_shards, MAX_SHARD)
-    ids = list(range(num_train))
-    if VAL_SHARD not in ids:
-        ids.append(VAL_SHARD)
-
-    # Count what's already downloaded
-    existing = sum(1 for i in ids if os.path.exists(os.path.join(DATA_DIR, f"shard_{i:05d}.parquet")))
-    if existing == len(ids):
-        print(f"Data: all {len(ids)} shards already downloaded at {DATA_DIR}")
-        return
-
-    needed = len(ids) - existing
-    print(f"Data: downloading {needed} shards ({existing} already exist)...")
-
-    workers = max(1, min(download_workers, needed))
-    with Pool(processes=workers) as pool:
-        results = pool.map(download_single_shard, ids)
-
-    ok = sum(1 for r in results if r)
-    print(f"Data: {ok}/{len(ids)} shards ready at {DATA_DIR}")
+# Every streamed record must carry exactly these keys.
+RECORD_KEYS = (
+    "object_id_ls",
+    "object_id_desi",
+    "ra_ls",
+    "dec_ls",
+    "ra_desi",
+    "dec_desi",
+    "_dist_arcsec",
+    "image",
+    "spectrum_flux",
+    "spectrum_lambda",
+)
 
 # ---------------------------------------------------------------------------
-# Tokenizer training
+# Records
 # ---------------------------------------------------------------------------
 
-def list_parquet_files():
-    """Return sorted list of parquet file paths in the data directory."""
-    files = sorted(f for f in os.listdir(DATA_DIR) if f.endswith(".parquet") and not f.endswith(".tmp"))
-    return [os.path.join(DATA_DIR, f) for f in files]
+
+def to_record(row):
+    """Convert one crossmatch row (as produced by lsdb) into a stream record.
+
+    A convenience for the lsdb path -- the harness scores the dict, not the
+    route taken to build it. An implementation that reads parquet directly is
+    free to construct the same dict however it likes.
+    """
+    image = row["image_ls"]
+    spectrum = row["spectrum_desi"]
+    return {
+        "object_id_ls": str(row["object_id_ls"]),
+        "object_id_desi": str(row["object_id_desi"]),
+        "ra_ls": float(row["ra_ls"]),
+        "dec_ls": float(row["dec_ls"]),
+        "ra_desi": float(row["ra_desi"]),
+        "dec_desi": float(row["dec_desi"]),
+        "_dist_arcsec": float(row["_dist_arcsec"]),
+        # Each band's flux arrives as an object array of 152 rows of 152 floats.
+        "image": np.stack([np.stack(list(band)) for band in image["flux"]]).astype(np.float32, copy=False),
+        "spectrum_flux": np.asarray(spectrum["flux"], dtype=np.float32),
+        "spectrum_lambda": np.asarray(spectrum["lambda"], dtype=np.float32),
+    }
 
 
-def text_iterator(max_chars=1_000_000_000, doc_cap=10_000):
-    """Yield documents from training split (all shards except pinned val shard)."""
-    parquet_paths = [p for p in list_parquet_files() if not p.endswith(VAL_FILENAME)]
-    nchars = 0
-    for filepath in parquet_paths:
-        pf = pq.ParquetFile(filepath)
-        for rg_idx in range(pf.num_row_groups):
-            rg = pf.read_row_group(rg_idx)
-            for text in rg.column("text").to_pylist():
-                doc = text[:doc_cap] if len(text) > doc_cap else text
-                nchars += len(doc)
-                yield doc
-                if nchars >= max_chars:
-                    return
+def digest_record(record):
+    """Bit-exact digest of a record's payload, used for audit verification."""
+    h = hashlib.blake2b(digest_size=16)
+    h.update(record["object_id_ls"].encode())
+    h.update(record["object_id_desi"].encode())
+    h.update(np.ascontiguousarray(record["image"], dtype=np.float32).tobytes())
+    h.update(np.ascontiguousarray(record["spectrum_flux"], dtype=np.float32).tobytes())
+    return h.digest()
 
 
-def train_tokenizer():
-    """Train BPE tokenizer using rustbpe, save as tiktoken pickle."""
-    tokenizer_pkl = os.path.join(TOKENIZER_DIR, "tokenizer.pkl")
-    token_bytes_path = os.path.join(TOKENIZER_DIR, "token_bytes.pt")
+class RecordError(Exception):
+    """A streamed record violated the required schema."""
 
-    if os.path.exists(tokenizer_pkl) and os.path.exists(token_bytes_path):
-        print(f"Tokenizer: already trained at {TOKENIZER_DIR}")
-        return
 
-    os.makedirs(TOKENIZER_DIR, exist_ok=True)
+def check_schema(record):
+    """Raise RecordError unless the record matches the required schema."""
+    if not isinstance(record, dict):
+        raise RecordError(f"record is {type(record).__name__}, expected dict")
+    missing = [k for k in RECORD_KEYS if k not in record]
+    if missing:
+        raise RecordError(f"record missing keys: {missing}")
 
-    parquet_files = list_parquet_files()
-    if len(parquet_files) < 2:
-        print("Tokenizer: need at least 2 data shards (1 train + 1 val). Download more data first.")
-        sys.exit(1)
+    image = np.asarray(record["image"])
+    if image.shape != IMAGE_SHAPE:
+        raise RecordError(f"image shape {image.shape}, expected {IMAGE_SHAPE}")
+    if not np.isfinite(image).all():
+        raise RecordError("image contains non-finite values")
 
-    # --- Train with rustbpe ---
-    print("Tokenizer: training BPE tokenizer...")
-    t0 = time.time()
+    for key in ("spectrum_flux", "spectrum_lambda"):
+        arr = np.asarray(record[key])
+        if arr.ndim != 1 or arr.size < 1000:
+            raise RecordError(f"{key} has shape {arr.shape}, expected a 1-D spectrum")
 
-    tokenizer = rustbpe.Tokenizer()
-    vocab_size_no_special = VOCAB_SIZE - len(SPECIAL_TOKENS)
-    tokenizer.train_from_iterator(text_iterator(), vocab_size_no_special, pattern=SPLIT_PATTERN)
+    dist = float(record["_dist_arcsec"])
+    if not 0.0 <= dist <= RADIUS_ARCSEC:
+        raise RecordError(f"_dist_arcsec {dist} outside [0, {RADIUS_ARCSEC}]")
 
-    # Build tiktoken encoding from trained merges
-    pattern = tokenizer.get_pattern()
-    mergeable_ranks = {bytes(k): v for k, v in tokenizer.get_mergeable_ranks()}
-    tokens_offset = len(mergeable_ranks)
-    special_tokens = {name: tokens_offset + i for i, name in enumerate(SPECIAL_TOKENS)}
-    enc = tiktoken.Encoding(
-        name="rustbpe",
-        pat_str=pattern,
-        mergeable_ranks=mergeable_ranks,
-        special_tokens=special_tokens,
+
+# ---------------------------------------------------------------------------
+# Crossmatch construction (shared by the truth builder and the baseline)
+# ---------------------------------------------------------------------------
+
+
+def open_crossmatch(columns_a=None, columns_b=None):
+    """Open both catalogs and plan the crossmatch. Returns the lazy lsdb Catalog."""
+    import lsdb
+
+    cat_a = lsdb.open_catalog(CATALOG_A, columns=columns_a)
+    cat_b = lsdb.open_catalog(CATALOG_B, columns=columns_b)
+    return cat_a.crossmatch(
+        cat_b,
+        radius_arcsec=RADIUS_ARCSEC,
+        n_neighbors=N_NEIGHBORS,
+        suffixes=SUFFIXES,
+        suffix_method="all_columns",
     )
 
-    # Save tokenizer
-    with open(tokenizer_pkl, "wb") as f:
-        pickle.dump(enc, f)
 
-    t1 = time.time()
-    print(f"Tokenizer: trained in {t1 - t0:.1f}s, saved to {tokenizer_pkl}")
+def patch_lsdb_empty_margin():
+    """Work around an lsdb crash when a partition's margin cache is empty."""
+    import pandas as pd
+    import nested_pandas as npd
+    from lsdb.dask import merge_catalog_functions
 
-    # --- Build token_bytes lookup for BPB evaluation ---
-    print("Tokenizer: building token_bytes lookup...")
-    special_set = set(SPECIAL_TOKENS)
-    token_bytes_list = []
-    for token_id in range(enc.n_vocab):
-        token_str = enc.decode([token_id])
-        if token_str in special_set:
-            token_bytes_list.append(0)
-        else:
-            token_bytes_list.append(len(token_str.encode("utf-8")))
-    token_bytes_tensor = torch.tensor(token_bytes_list, dtype=torch.int32)
-    torch.save(token_bytes_tensor, token_bytes_path)
-    print(f"Tokenizer: saved token_bytes to {token_bytes_path}")
+    def _safe_concat(partition, margin):
+        if margin is None or len(margin) == 0:
+            return partition
+        if len(partition) == 0:
+            return npd.NestedFrame(margin)
+        return npd.NestedFrame(pd.concat([partition, margin]))
 
-    # Sanity check
-    test = "Hello world! Numbers: 123. Unicode: 你好"
-    encoded = enc.encode_ordinary(test)
-    decoded = enc.decode(encoded)
-    assert decoded == test, f"Tokenizer roundtrip failed: {test!r} -> {decoded!r}"
-    print(f"Tokenizer: sanity check passed (vocab_size={enc.n_vocab})")
+    merge_catalog_functions.concat_partition_and_margin = _safe_concat
+
 
 # ---------------------------------------------------------------------------
-# Runtime utilities (imported by train.py)
+# One-time preparation
 # ---------------------------------------------------------------------------
 
-class Tokenizer:
-    """Minimal tokenizer wrapper. Training is handled above."""
 
-    def __init__(self, enc):
-        self.enc = enc
-        self.bos_token_id = enc.encode_single_token(BOS_TOKEN)
+def build_truth(max_partitions=None, n_workers=8):
+    """Build the ground-truth match table, canonical order, and audit digests.
 
-    @classmethod
-    def from_directory(cls, tokenizer_dir=TOKENIZER_DIR):
-        with open(os.path.join(tokenizer_dir, "tokenizer.pkl"), "rb") as f:
-            enc = pickle.load(f)
-        return cls(enc)
+    The truth table only needs coordinates and ids, so it is built from a
+    column-projected crossmatch -- about 2.5x cheaper per partition than
+    dragging the image payload along.
 
-    def get_vocab_size(self):
-        return self.enc.n_vocab
-
-    def get_bos_token_id(self):
-        return self.bos_token_id
-
-    def encode(self, text, prepend=None, num_threads=8):
-        if prepend is not None:
-            prepend_id = prepend if isinstance(prepend, int) else self.enc.encode_single_token(prepend)
-        if isinstance(text, str):
-            ids = self.enc.encode_ordinary(text)
-            if prepend is not None:
-                ids.insert(0, prepend_id)
-        elif isinstance(text, list):
-            ids = self.enc.encode_ordinary_batch(text, num_threads=num_threads)
-            if prepend is not None:
-                for row in ids:
-                    row.insert(0, prepend_id)
-        else:
-            raise ValueError(f"Invalid input type: {type(text)}")
-        return ids
-
-    def decode(self, ids):
-        return self.enc.decode(ids)
-
-
-def get_token_bytes(device="cpu"):
-    path = os.path.join(TOKENIZER_DIR, "token_bytes.pt")
-    with open(path, "rb") as f:
-        return torch.load(f, map_location=device)
-
-
-def _document_batches(split, tokenizer_batch_size=128):
-    """Infinite iterator over document batches from parquet files."""
-    parquet_paths = list_parquet_files()
-    assert len(parquet_paths) > 0, "No parquet files found. Run prepare.py first."
-    val_path = os.path.join(DATA_DIR, VAL_FILENAME)
-    if split == "train":
-        parquet_paths = [p for p in parquet_paths if p != val_path]
-        assert len(parquet_paths) > 0, "No training shards found."
-    else:
-        parquet_paths = [val_path]
-    epoch = 1
-    while True:
-        for filepath in parquet_paths:
-            pf = pq.ParquetFile(filepath)
-            for rg_idx in range(pf.num_row_groups):
-                rg = pf.read_row_group(rg_idx)
-                batch = rg.column('text').to_pylist()
-                for i in range(0, len(batch), tokenizer_batch_size):
-                    yield batch[i:i+tokenizer_batch_size], epoch
-        epoch += 1
-
-
-def make_dataloader(tokenizer, B, T, split, buffer_size=1000):
+    The worker count is deliberately modest. This is a one-time job, and a
+    build that saturates the network link makes any measurement taken
+    alongside it look artificially slow.
     """
-    BOS-aligned dataloader with best-fit packing.
-    Every row starts with BOS. Documents packed using best-fit to minimize cropping.
-    When no document fits remaining space, crops shortest doc to fill exactly.
-    100% utilization (no padding).
-    """
-    assert split in ["train", "val"]
-    row_capacity = T + 1
-    batches = _document_batches(split)
-    bos_token = tokenizer.get_bos_token_id()
-    doc_buffer = []
-    epoch = 1
+    import warnings
 
-    def refill_buffer():
-        nonlocal epoch
-        doc_batch, epoch = next(batches)
-        token_lists = tokenizer.encode(doc_batch, prepend=bos_token)
-        doc_buffer.extend(token_lists)
+    import dask
+    import pandas as pd
+    from dask.distributed import Client
 
-    # Pre-allocate buffers: [inputs (B*T) | targets (B*T)]
-    row_buffer = torch.empty((B, row_capacity), dtype=torch.long)
-    cpu_buffer = torch.empty(2 * B * T, dtype=torch.long, pin_memory=True)
-    gpu_buffer = torch.empty(2 * B * T, dtype=torch.long, device="cuda")
-    cpu_inputs = cpu_buffer[:B * T].view(B, T)
-    cpu_targets = cpu_buffer[B * T:].view(B, T)
-    inputs = gpu_buffer[:B * T].view(B, T)
-    targets = gpu_buffer[B * T:].view(B, T)
+    warnings.filterwarnings("ignore")
+    os.makedirs(CACHE_DIR, exist_ok=True)
+    patch_lsdb_empty_margin()
 
-    while True:
-        for row_idx in range(B):
-            pos = 0
-            while pos < row_capacity:
-                while len(doc_buffer) < buffer_size:
-                    refill_buffer()
+    print("planning column-projected crossmatch...", flush=True)
+    t0 = time.perf_counter()
+    projected = ["ra", "dec", "object_id"]
+    xmatch = open_crossmatch(columns_a=projected, columns_b=projected)
+    npartitions = xmatch._ddf.npartitions
+    if max_partitions is not None:
+        npartitions = min(npartitions, max_partitions)
+    print(f"  {npartitions} aligned partitions ({time.perf_counter() - t0:.1f}s)", flush=True)
 
-                remaining = row_capacity - pos
+    dask.config.set({"distributed.admin.large-graph-warning-threshold": "100 MiB"})
+    client = Client(n_workers=n_workers, threads_per_worker=1)
+    client.run(patch_lsdb_empty_margin)
+    print(f"  dask client with {n_workers} workers: {client.dashboard_link}", flush=True)
 
-                # Find largest doc that fits entirely
-                best_idx = -1
-                best_len = 0
-                for i, doc in enumerate(doc_buffer):
-                    doc_len = len(doc)
-                    if doc_len <= remaining and doc_len > best_len:
-                        best_idx = i
-                        best_len = doc_len
+    frames = []
+    t0 = time.perf_counter()
+    try:
+        futures = [client.compute(xmatch._ddf.partitions[i]) for i in range(npartitions)]
+        for i, future in enumerate(futures):
+            part = future.result()
+            if len(part):
+                frames.append(
+                    pd.DataFrame(
+                        {
+                            "object_id_ls": part["object_id_ls"].astype(str),
+                            "object_id_desi": part["object_id_desi"].astype(str),
+                            "dist_arcsec": part["_dist_arcsec"].astype("float64"),
+                            "partition": np.full(len(part), i, dtype="int32"),
+                        }
+                    )
+                )
+            done = i + 1
+            elapsed = time.perf_counter() - t0
+            rate = done / elapsed
+            print(
+                f"  partition {i:4d}/{npartitions}  {len(part):5d} matches  "
+                f"{elapsed:6.1f}s elapsed  eta {(npartitions - done) / rate:6.1f}s",
+                flush=True,
+            )
+    finally:
+        client.close()
 
-                if best_idx >= 0:
-                    doc = doc_buffer.pop(best_idx)
-                    row_buffer[row_idx, pos:pos + len(doc)] = torch.tensor(doc, dtype=torch.long)
-                    pos += len(doc)
-                else:
-                    # No doc fits — crop shortest to fill remaining
-                    shortest_idx = min(range(len(doc_buffer)), key=lambda i: len(doc_buffer[i]))
-                    doc = doc_buffer.pop(shortest_idx)
-                    row_buffer[row_idx, pos:pos + remaining] = torch.tensor(doc[:remaining], dtype=torch.long)
-                    pos += remaining
+    truth = pd.concat(frames, ignore_index=True) if frames else pd.DataFrame(
+        columns=["object_id_ls", "object_id_desi", "dist_arcsec", "partition"]
+    )
+    truth.to_parquet(TRUTH_PATH, index=False)
+    print(f"\nwrote {TRUTH_PATH}: {len(truth)} matches", flush=True)
 
-        cpu_inputs.copy_(row_buffer[:, :-1])
-        cpu_targets.copy_(row_buffer[:, 1:])
-        gpu_buffer.copy_(cpu_buffer, non_blocking=True)
-        yield inputs, targets, epoch
+    # Canonical traversal order: partitions holding at least one match, ascending.
+    # Empty partitions are excluded because they are invisible to the harness.
+    order = sorted(int(p) for p in truth["partition"].unique())
+    with open(ORDER_PATH, "w") as f:
+        json.dump({"npartitions": int(npartitions), "order": order}, f)
+    print(f"wrote {ORDER_PATH}: {len(order)} non-empty partitions", flush=True)
+
+    build_audit(max_partitions=max_partitions)
+
+
+def build_audit(max_partitions=None):
+    """Store bit-exact payload digests for the pinned audit partitions."""
+    import warnings
+
+    import dask
+
+    warnings.filterwarnings("ignore")
+    warnings.simplefilter("ignore")
+    dask.config.set(scheduler="synchronous")
+    patch_lsdb_empty_margin()
+
+    partitions = [p for p in AUDIT_PARTITIONS if max_partitions is None or p < max_partitions]
+    print(f"\nbuilding audit digests for partitions {partitions}...", flush=True)
+    xmatch = open_crossmatch()
+
+    keys, digests = [], []
+    for p in partitions:
+        t0 = time.perf_counter()
+        part = xmatch._ddf.partitions[p].compute()
+        for _, row in part.iterrows():
+            record = to_record(row)
+            keys.append(f"{record['object_id_ls']}|{record['object_id_desi']}")
+            digests.append(digest_record(record))
+        print(f"  partition {p}: {len(part)} records ({time.perf_counter() - t0:.1f}s)", flush=True)
+
+    np.savez(
+        AUDIT_PATH,
+        keys=np.array(keys, dtype=object),
+        digests=np.array([np.frombuffer(d, dtype=np.uint8) for d in digests], dtype=np.uint8)
+        if digests
+        else np.zeros((0, 16), dtype=np.uint8),
+        partitions=np.array(partitions, dtype=np.int32),
+    )
+    print(f"wrote {AUDIT_PATH}: {len(keys)} audited records", flush=True)
+
+
+def load_truth():
+    """Load the prep artifacts. Raises a clear error if prep has not been run."""
+    import pandas as pd
+
+    for path in (TRUTH_PATH, ORDER_PATH, AUDIT_PATH):
+        if not os.path.exists(path):
+            sys.exit(f"missing {path} -- run `uv run prepare.py` first")
+
+    truth = pd.read_parquet(TRUTH_PATH)
+    pairs = {
+        f"{a}|{b}": int(p)
+        for a, b, p in zip(truth["object_id_ls"], truth["object_id_desi"], truth["partition"])
+    }
+    with open(ORDER_PATH) as f:
+        order = json.load(f)["order"]
+    audit_npz = np.load(AUDIT_PATH, allow_pickle=True)
+    audit = {
+        str(k): bytes(d)
+        for k, d in zip(audit_npz["keys"], audit_npz["digests"])
+    }
+    return pairs, {p: rank for rank, p in enumerate(order)}, audit
+
 
 # ---------------------------------------------------------------------------
-# Evaluation (DO NOT CHANGE — this is the fixed metric)
+# Evaluation (DO NOT CHANGE -- this is the fixed metric)
 # ---------------------------------------------------------------------------
 
-@torch.no_grad()
-def evaluate_bpb(model, tokenizer, batch_size):
+
+class PeakMemoryTracker:
+    """Background thread sampling RSS of this process and all its descendants."""
+
+    def __init__(self, interval=0.25):
+        self._interval = interval
+        self._process = psutil.Process()
+        self._peak = 0
+        self._stop = threading.Event()
+        self._thread = None
+
+    def _total_rss(self):
+        try:
+            rss = self._process.memory_info().rss
+            for child in self._process.children(recursive=True):
+                try:
+                    rss += child.memory_info().rss
+                except (psutil.NoSuchProcess, psutil.AccessDenied):
+                    pass
+            return rss
+        except (psutil.NoSuchProcess, psutil.AccessDenied):
+            return 0
+
+    def start(self):
+        self._peak = self._total_rss()
+        self._stop.clear()
+        self._thread = threading.Thread(target=self._sample, daemon=True)
+        self._thread.start()
+
+    def _sample(self):
+        while not self._stop.is_set():
+            self._peak = max(self._peak, self._total_rss())
+            self._stop.wait(self._interval)
+
+    def stop(self):
+        self._stop.set()
+        if self._thread:
+            self._thread.join()
+        return max(self._peak, self._total_rss())
+
+
+def run_benchmark(stream_fn):
+    """Score a streaming implementation. This is the ground truth metric.
+
+    Iterates `stream_fn()` for TIME_BUDGET seconds and counts how many distinct,
+    verified crossmatch records it delivered per second.
+
+    A record scores if and only if it matches the required schema, corresponds to
+    a real match in the truth table, and has not been yielded already. Records
+    from the audit partitions additionally have their payload verified
+    bit-exactly, so a run cannot score by fabricating images.
     """
-    Bits per byte (BPB): vocab size-independent evaluation metric.
-    Sums per-token cross-entropy (in nats), sums target byte lengths,
-    then converts nats/byte to bits/byte. Special tokens (byte length 0)
-    are excluded from both sums.
-    Uses fixed MAX_SEQ_LEN so results are comparable across configs.
-    """
-    token_bytes = get_token_bytes(device="cuda")
-    val_loader = make_dataloader(tokenizer, batch_size, MAX_SEQ_LEN, "val")
-    steps = EVAL_TOKENS // (batch_size * MAX_SEQ_LEN)
-    total_nats = 0.0
-    total_bytes = 0
-    for _ in range(steps):
-        x, y, _ = next(val_loader)
-        loss_flat = model(x, y, reduction='none').view(-1)
-        y_flat = y.view(-1)
-        nbytes = token_bytes[y_flat]
-        mask = nbytes > 0
-        total_nats += (loss_flat * mask).sum().item()
-        total_bytes += nbytes.sum().item()
-    return total_nats / (math.log(2) * total_bytes)
+    pairs, ranks, audit = load_truth()
+
+    tracker = PeakMemoryTracker()
+    tracker.start()
+    # Host-wide counter, so it is a diagnostic rather than part of the score --
+    # anything else on this machine using the network shows up here too.
+    net0 = psutil.net_io_counters().bytes_recv
+
+    matched, duplicates = 0, 0
+    seen = set()
+    seen_partitions = set()
+    max_rank = -1
+    failure = None
+    time_to_first_row = None
+
+    t0 = time.perf_counter()
+    try:
+        for record in stream_fn():
+            now = time.perf_counter()
+            if time_to_first_row is None:
+                time_to_first_row = now - t0
+
+            check_schema(record)
+            key = f"{record['object_id_ls']}|{record['object_id_desi']}"
+            if key not in pairs:
+                raise RecordError(f"{key} is not a real match")
+            if key in audit and digest_record(record) != audit[key]:
+                raise RecordError(f"{key} payload does not match the audited original")
+
+            if key in seen:
+                duplicates += 1
+            else:
+                seen.add(key)
+                matched += 1
+                partition = pairs[key]
+                seen_partitions.add(partition)
+                max_rank = max(max_rank, ranks[partition])
+
+            if now - t0 >= TIME_BUDGET:
+                break
+    except RecordError as exc:
+        failure = str(exc)
+
+    elapsed = time.perf_counter() - t0
+    peak_rss = tracker.stop()
+    net_bytes = psutil.net_io_counters().bytes_recv - net0
+
+    # A run may reach ahead of the canonical order only as far as its in-flight
+    # window: enough slack for parallel prefetch, not enough to harvest the
+    # match-dense partitions and skip the rest.
+    order_ok = max_rank - (len(seen_partitions) - 1) <= IN_FLIGHT_WINDOW if seen_partitions else True
+
+    if failure is None and not order_ok:
+        failure = (
+            f"reached partition rank {max_rank} having finished only "
+            f"{len(seen_partitions)} -- more than {IN_FLIGHT_WINDOW} left behind"
+        )
+    if failure is None and matched == 0:
+        failure = "no records streamed"
+
+    rows_per_sec = matched / elapsed if elapsed > 0 else 0.0
+    print("---")
+    print(f"matched_rows:        {matched}")
+    print(f"rows_per_sec:        {rows_per_sec:.2f}")
+    print(f"verify:              {'OK' if failure is None else 'FAIL'}")
+    print(f"partition_order_ok:  {str(order_ok).lower()}")
+    print(f"partitions_touched:  {len(seen_partitions)}")
+    print(f"duplicate_rows:      {duplicates}")
+    print(f"bytes_downloaded_mb: {net_bytes / 1e6:.1f}")
+    print(f"mb_per_sec:          {net_bytes / 1e6 / elapsed if elapsed > 0 else 0.0:.1f}")
+    print(f"time_to_first_row:   {time_to_first_row if time_to_first_row is not None else -1:.1f}")
+    print(f"elapsed_seconds:     {elapsed:.1f}")
+    print(f"peak_rss_mb:         {peak_rss / 1e6:.1f}")
+    if failure is not None:
+        print(f"failure:             {failure}")
+        sys.exit(1)
+
 
 # ---------------------------------------------------------------------------
-# Main
+# Entry point
 # ---------------------------------------------------------------------------
 
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser(description="Prepare data and tokenizer for autoresearch")
-    parser.add_argument("--num-shards", type=int, default=10, help="Number of training shards to download (-1 = all). Val shard is always pinned.")
-    parser.add_argument("--download-workers", type=int, default=8, help="Number of parallel download workers")
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--max-partitions", type=int, default=None,
+                        help="only build truth for the first N partitions (testing)")
+    parser.add_argument("--workers", type=int, default=8,
+                        help="dask workers used to build the truth table. Kept modest on "
+                             "purpose: saturating the link makes concurrent measurements noisy")
+    parser.add_argument("--audit-only", action="store_true",
+                        help="rebuild only the audit digests")
     args = parser.parse_args()
 
-    num_shards = MAX_SHARD if args.num_shards == -1 else args.num_shards
-
-    print(f"Cache directory: {CACHE_DIR}")
-    print()
-
-    # Step 1: Download data
-    download_data(num_shards, download_workers=args.download_workers)
-    print()
-
-    # Step 2: Train tokenizer
-    train_tokenizer()
-    print()
-    print("Done! Ready to train.")
+    if args.audit_only:
+        build_audit(max_partitions=args.max_partitions)
+    else:
+        build_truth(max_partitions=args.max_partitions, n_workers=args.workers)

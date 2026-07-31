@@ -1,26 +1,38 @@
-# autoresearch
+# autoresearch-astro
 
-![teaser](progress.png)
+A fork of [karpathy/autoresearch](https://github.com/karpathy/autoresearch) pointed at a different research problem.
 
-*One day, frontier AI research used to be done by meat computers in between eating, sleeping, having other fun, and synchronizing once in a while using sound wave interconnect in the ritual of "group meeting". That era is long gone. Research is now entirely the domain of autonomous swarms of AI agents running across compute cluster megastructures in the skies. The agents claim that we are now in the 10,205th generation of the code base, in any case no one could tell if that's right or wrong as the "code" is now a self-modifying binary that has grown beyond human comprehension. This repo is the story of how it all began. -@karpathy, March 2026*.
+Upstream gives an AI agent a small LLM training setup and lets it experiment overnight, minimising validation loss. This fork keeps the machinery — one editable file, one fixed metric, a keep-or-discard git loop driven by `program.md` — and swaps the problem for a data engineering one:
 
-The idea: give an AI agent a small but real LLM training setup and let it experiment autonomously overnight. It modifies the code, trains for 5 minutes, checks if the result improved, keeps or discards, and repeats. You wake up in the morning to a log of experiments and (hopefully) a better model. The training code here is a simplified single-GPU implementation of [nanochat](https://github.com/karpathy/nanochat). The core idea is that you're not touching any of the Python files like you normally would as a researcher. Instead, you are programming the `program.md` Markdown files that provide context to the AI agents and set up your autonomous research org. The default `program.md` in this repo is intentionally kept as a bare bones baseline, though it's obvious how one would iterate on it over time to find the "research org code" that achieves the fastest research progress, how you'd add more agents to the mix, etc. A bit more context on this project is here in this [tweet](https://x.com/karpathy/status/2029701092347630069) and [this tweet](https://x.com/karpathy/status/2031135152349524125).
+> **Stream crossmatched galaxy images and spectra off HuggingFace as fast as possible.**
+
+The core idea is unchanged: you're not touching the Python files like you normally would as a researcher. Instead you are programming the `program.md` Markdown file that provides context to the AI agents and sets up your autonomous research org.
+
+## The problem
+
+[`UniverseTBD/mmu_ssl_legacysurvey_north`](https://huggingface.co/datasets/UniverseTBD/mmu_ssl_legacysurvey_north) — 14,174,203 Legacy Survey North galaxy cutouts, 152x152 pixels in three optical bands, 3.4 TiB across 5488 partitions.
+
+[`UniverseTBD/mmu_desi_edr_sv3`](https://huggingface.co/datasets/UniverseTBD/mmu_desi_edr_sv3) — 1,126,441 DESI EDR SV3 spectra, 62 GiB across 306 partitions.
+
+Both are [HATS](https://hats.readthedocs.io/) catalogs with 10 arcsecond margin caches, so [LSDB](https://lsdb.readthedocs.io/) can crossmatch them directly off the Hub. Matching them at 1 arcsecond gives paired (image, spectrum) records — the training input for multimodal astronomy models. The agent's job is to get those records out of the pipe as fast as possible.
+
+This is a real bottleneck, not a toy. Existing multimodal work here consumes *pre-computed* crossmatches or pre-baked file lists precisely because streaming a live one is slow.
 
 ## How it works
 
 The repo is deliberately kept small and only really has three files that matter:
 
-- **`prepare.py`** — fixed constants, one-time data prep (downloads training data, trains a BPE tokenizer), and runtime utilities (dataloader, evaluation). Not modified.
-- **`train.py`** — the single file the agent edits. Contains the full GPT model, optimizer (Muon + AdamW), and training loop. Everything is fair game: architecture, hyperparameters, optimizer, batch size, etc. **This file is edited and iterated on by the agent**.
+- **`prepare.py`** — fixed constants, one-time ground-truth prep, and the metric. Not modified.
+- **`stream.py`** — the single file the agent edits. Contains the streaming implementation. Everything is fair game: the baseline is the raw LSDB stack, but the agent can throw all of it out and read parquet byte ranges by hand if that's faster. **This file is edited and iterated on by the agent**.
 - **`program.md`** — baseline instructions for one agent. Point your agent here and let it go. **This file is edited and iterated on by the human**.
 
-By design, training runs for a **fixed 5-minute time budget** (wall clock, excluding startup/compilation), regardless of the details of your compute. The metric is **val_bpb** (validation bits per byte) — lower is better, and vocab-size-independent so architectural changes are fairly compared.
+By design, streaming runs for a **fixed 90-second time budget** (wall clock, cold start included). The metric is **rows_per_sec** — verified crossmatch records delivered per second, higher is better.
 
-If you are new to neural networks, this ["Dummy's Guide"](https://x.com/hooeem/status/2030720614752039185) looks pretty good for a lot more context.
+A record only counts if it is a real match, has not been yielded before, and carries the full payload: a (3, 152, 152) float32 image and the spectrum arrays. Dropping the payload to go faster isn't an optimisation, it's a different problem. `prepare.py` builds a ground-truth match table once and checks every record against it, verifying payloads bit-exactly on two pinned partitions.
 
 ## Quick start
 
-**Requirements:** A single NVIDIA GPU (tested on H100), Python 3.10+, [uv](https://docs.astral.sh/uv/).
+**Requirements:** CPU and a network connection. No GPU. Tested on 24 cores / 187 GB RAM. Python 3.11+, [uv](https://docs.astral.sh/uv/).
 
 ```bash
 
@@ -30,11 +42,14 @@ curl -LsSf https://astral.sh/uv/install.sh | sh
 # 2. Install dependencies
 uv sync
 
-# 3. Download data and train tokenizer (one-time, ~2 min)
+# 3. Build the ground-truth match table (one-time, ~10 min)
 uv run prepare.py
 
-# 4. Manually run a single training experiment (~5 min)
-uv run train.py
+# ...or go wider if nothing else needs the network
+uv run prepare.py --workers 16
+
+# 4. Manually run a single streaming experiment (~90 sec)
+uv run stream.py
 ```
 
 If the above commands all work ok, your setup is working and you can go into autonomous research mode.
@@ -52,40 +67,27 @@ The `program.md` file is essentially a super lightweight "skill".
 ## Project structure
 
 ```
-prepare.py      — constants, data prep + runtime utilities (do not modify)
-train.py        — model, optimizer, training loop (agent modifies this)
+prepare.py      — constants, ground-truth prep + the metric (do not modify)
+stream.py       — the streaming implementation (agent modifies this)
 program.md      — agent instructions
+analysis.ipynb  — plots of results.tsv
 pyproject.toml  — dependencies
 ```
 
 ## Design choices
 
-- **Single file to modify.** The agent only touches `train.py`. This keeps the scope manageable and diffs reviewable.
-- **Fixed time budget.** Training always runs for exactly 5 minutes, regardless of your specific platform. This means you can expect approx 12 experiments/hour and approx 100 experiments while you sleep. There are two upsides of this design decision. First, this makes experiments directly comparable regardless of what the agent changes (model size, batch size, architecture, etc). Second, this means that autoresearch will find the most optimal model for your platform in that time budget. The downside is that your runs (and results) become not comparable to other people running on other compute platforms.
-- **Self-contained.** No external dependencies beyond PyTorch and a few small packages. No distributed training, no complex configs. One GPU, one file, one metric.
+- **Single file to modify.** The agent only touches `stream.py`. This keeps the scope manageable and diffs reviewable.
+- **Fixed time budget.** Streaming always runs for 90 seconds, and the cold start counts against it. Opening the two catalogs and planning the crossmatch costs the baseline ~30 seconds, a third of the budget — so eliminating startup is as legitimate a target as raising steady-state throughput. 90 seconds means roughly 35 experiments an hour, or ~280 while you sleep.
+- **Cold cache every run.** The harness redirects every HuggingFace and fsspec cache at a fresh temp dir, so no run benefits from a previous one's downloads. The problem is streaming, not downloading once.
+- **Dependencies are open.** Unlike upstream, the agent may `uv add` anything. Most of the headroom in a data pipeline lives in which I/O library you reach for.
+- **Verified output.** Speed with the wrong answer is not speed. Every record is checked against a ground-truth match table, and payloads on two pinned partitions are checked bit-exactly.
+- **Canonical partition order.** Because the score is per-second, streaming only the match-dense partitions would inflate it for free. The harness fixes an ascending traversal order and allows a 32-partition in-flight window, which parallel prefetching passes and cherry-picking doesn't.
 
-## Platform support
+## Baseline
 
-This code currently requires that you have a single NVIDIA GPU. In principle it is quite possible to support CPU, MPS and other platforms but this would also bloat the code. I'm not 100% sure that I want to take this on personally right now. People can reference (or have their agents reference) the full/parent nanochat repository that has wider platform support and shows the various solutions (e.g. a Flash Attention 3 kernels fallback implementation, generic device support, autodetection, etc.), feel free to create forks or discussions for other platforms and I'm happy to link to them here in the README in some new notable forks section or etc.
+The raw LSDB stack — `open_catalog` twice, `crossmatch`, walk the 200 aligned partitions with `CatalogStream` — gets about **32 rows/sec**, with 30 seconds to the first row and ~57 MB/s of throughput, covering 5-6 of the 191 partitions that contain matches. There are 137,906 matches in total, so streaming all of them inside the budget would take ~1500 rows/sec.
 
-Seeing as there seems to be a lot of interest in tinkering with autoresearch on much smaller compute platforms than an H100, a few extra words. If you're going to try running autoresearch on smaller computers (Macbooks etc.), I'd recommend one of the forks below. On top of this, here are some recommendations for how to tune the defaults for much smaller models for aspiring forks:
-
-1. To get half-decent results I'd use a dataset with a lot less entropy, e.g. this [TinyStories dataset](https://huggingface.co/datasets/karpathy/tinystories-gpt4-clean). These are GPT-4 generated short stories. Because the data is a lot narrower in scope, you will see reasonable results with a lot smaller models (if you try to sample from them after training).
-2. You might experiment with decreasing `vocab_size`, e.g. from 8192 down to 4096, 2048, 1024, or even - simply byte-level tokenizer with 256 possibly bytes after utf-8 encoding.
-3. In `prepare.py`, you'll want to lower `MAX_SEQ_LEN` a lot, depending on the computer even down to 256 etc. As you lower `MAX_SEQ_LEN`, you may want to experiment with increasing `DEVICE_BATCH_SIZE` in `train.py` slightly to compensate. The number of tokens per fwd/bwd pass is the product of these two.
-4. Also in `prepare.py`, you'll want to decrease `EVAL_TOKENS` so that your validation loss is evaluated on a lot less data.
-5. In `train.py`, the primary single knob that controls model complexity is the `DEPTH` (default 8, here). A lot of variables are just functions of this, so e.g. lower it down to e.g. 4.
-6. You'll want to most likely use `WINDOW_PATTERN` of just "L", because "SSSL" uses alternating banded attention pattern that may be very inefficient for you. Try it.
-7. You'll want to lower `TOTAL_BATCH_SIZE` a lot, but keep it powers of 2, e.g. down to `2**14` (~16K) or so even, hard to tell.
-
-I think these would be the reasonable hyperparameters to play with. Ask your favorite coding agent for help and copy paste them this guide, as well as the full source code.
-
-## Notable forks
-
-- [miolini/autoresearch-macos](https://github.com/miolini/autoresearch-macos) (MacOS)
-- [trevin-creator/autoresearch-mlx](https://github.com/trevin-creator/autoresearch-mlx) (MacOS)
-- [jsegov/autoresearch-win-rtx](https://github.com/jsegov/autoresearch-win-rtx) (Windows)
-- [andyluo7/autoresearch](https://github.com/andyluo7/autoresearch) (AMD)
+Throughput is noisy: five baseline runs measured 24.14, 27.72, 32.45, 33.69 and 33.79 rows/sec with no code change, so treat anything under a ~10% difference as noise. Much of that spread is granularity rather than the network — the baseline emits a whole partition at a time, so a run ends on either 5 or 6 completed partitions depending on where the clock falls. Some measured starting points for where the headroom is are listed at the bottom of `program.md`.
 
 ## License
 
