@@ -1,0 +1,5 @@
+# program.md documents results.tsv as tab-separated and its example block is the
+# template the agent copies. Formatters rewrite those tabs as spaces, which
+# silently teaches the agent to write space-separated rows.
+program.md
+results.tsv
