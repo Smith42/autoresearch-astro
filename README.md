@@ -54,6 +54,25 @@ uv run stream.py
 
 If the above commands all work ok, your setup is working and you can go into autonomous research mode.
 
+### Skipping the prep build
+
+[`truth.parquet`](truth.parquet) and [`canonical_order.json`](canonical_order.json) are committed at the repo root — the ground-truth match table for all 200 aligned partitions (137,906 matches, 3.5 MB) and the canonical traversal order derived from it. Copy both into place:
+
+```bash
+mkdir -p ~/.cache/autoresearch-astro
+cp truth.parquet canonical_order.json ~/.cache/autoresearch-astro/
+```
+
+The third artifact, `audit.npz`, is not committed. Build it with:
+
+```bash
+uv run prepare.py --audit-only
+```
+
+That still downloads the two audit partitions in full (~2 GB), but it takes a couple of minutes instead of the ~25 the full build needs.
+
+Note that `truth.parquet` is the answer key: it lists every matched `(object_id_ls, object_id_desi)` pair and the partition holding it. A `stream.py` that reads it is no longer solving the streaming problem — see the "What you CANNOT do" rules in `program.md`.
+
 ## Running the agent
 
 Simply spin up your Claude/Codex or whatever you want in this repo (and disable all permissions), then you can prompt something like:
